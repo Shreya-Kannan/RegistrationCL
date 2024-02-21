@@ -142,6 +142,30 @@ def scan_to_atlas(vol_names, atlas, bidir=False, batch_size=1, no_warp=False, se
             outvols.append(zeros)
         yield (invols, outvols)
 
+def scan_to_scan_custom(vol_names, bidir=False, batch_size=1, prob_same=0, no_warp=False, dataset_name = 'AbdomenMRCTs', **kwargs):
+    zeros = None
+    fixed = [pair['0'] for pair in vol_names]
+    moving = [pair['1'] for pair in vol_names]
+
+    gen_fixed = volgen(fixed, batch_size=batch_size, **kwargs)
+    gen_moving = volgen(moving, batch_size=batch_size, **kwargs)
+    while True:
+        scan1 = next(gen_moving)[0]
+        scan2 = next(gen_fixed)[0]
+        
+        # cache zeros
+        if not no_warp and zeros is None:
+            shape = scan1.shape[1:-1]
+            zeros = np.zeros((batch_size, *shape, len(shape)))
+
+        invols = [scan1, scan2]
+        outvols = [scan2, scan1] if bidir else [scan2]
+        if not no_warp:
+            outvols.append(zeros)
+
+        yield (invols, outvols)
+
+
 
 def semisupervised(vol_names, seg_names, labels, atlas_file=None, downsize=2):
     """

@@ -40,10 +40,13 @@ import argparse
 import time
 import numpy as np
 import torch
+import json
+from matplotlib import pyplot as plt
 
 # import voxelmorph with pytorch backend
 os.environ['NEURITE_BACKEND'] = 'pytorch'
 os.environ['VXM_BACKEND'] = 'pytorch'
+torch.cuda.empty_cache()
 import voxelmorph as vxm  # nopep8
 
 # parse the commandline
@@ -84,22 +87,43 @@ parser.add_argument('--int-downsize', type=int, default=2,
                     help='flow downsample factor for integration (default: 2)')
 parser.add_argument('--bidir', action='store_true', help='enable bidirectional cost function')
 
+#--for RandomfeaturesNet
+parser.add_argument('--random-mode', type=bool, default=False,
+                    help='Whether to run model with RandomFeaturesNet')
+parser.add_argument('--filt-size', type=int, default=5,
+                    help='Random Features Filter size(default: 5)')
+parser.add_argument('--n-features', type=int, default=8,
+                    help='Random Features n features(default: 8)')
+
 # loss hyperparameters
 parser.add_argument('--image-loss', default='mse',
-                    help='image reconstruction loss - can be mse or ncc (default: mse)')
+                    help='image reconstruction loss - can be mse , ncc or cl (default: mse)')
 parser.add_argument('--lambda', type=float, dest='weight', default=0.01,
                     help='weight of deformation loss (default: 0.01)')
+parser.add_argument('--cl-type', default='dv',
+                    help='type of contrastive loss')
 args = parser.parse_args()
 
 bidir = args.bidir
 
 # load and prepare training data
-train_files = vxm.py.utils.read_file_list(args.img_list, prefix=args.img_prefix,
-                                          suffix=args.img_suffix)
+#train_files = vxm.py.utils.read_file_list(args.img_list, prefix=args.img_prefix, suffix=args.img_suffix)
+with open(args.img_list) as f:
+    dataset_json = json.load(f)
+    train_files = dataset_json["training_paired_images"]
+    val_files = dataset_json["registration_val"]
+
+#print(train_files)
+
 assert len(train_files) > 0, 'Could not find any training data.'
+assert len(val_files) > 0, 'Could not find any validation data.'
+
+val_steps_per_epoch = len(val_files)
 
 # no need to append an extra feature axis if data is multichannel
 add_feat_axis = not args.multichannel
+
+print(bidir)
 
 if args.atlas:
     # scan-to-atlas generator
@@ -110,11 +134,16 @@ if args.atlas:
                                              add_feat_axis=add_feat_axis)
 else:
     # scan-to-scan generator
-    generator = vxm.generators.scan_to_scan(
+    generator = vxm.generators.scan_to_scan_custom(
         train_files, batch_size=args.batch_size, bidir=args.bidir, add_feat_axis=add_feat_axis)
+    val_generator = vxm.generators.scan_to_scan_custom(
+        val_files, batch_size=args.batch_size, bidir=args.bidir, add_feat_axis=add_feat_axis)
 
 # extract shape from sampled input
-inshape = next(generator)[0][0].shape[1:-1]
+inshape = next(generator)[0][0].shape
+print(inshape)
+inshape = inshape[1:-1]
+print(inshape)
 
 # prepare model folder
 model_dir = args.model_dir
@@ -124,6 +153,7 @@ os.makedirs(model_dir, exist_ok=True)
 gpus = args.gpu.split(',')
 nb_gpus = len(gpus)
 device = 'cuda'
+#device ='cpu'
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 assert np.mod(args.batch_size, nb_gpus) == 0, \
     'Batch size (%d) should be a multiple of the nr of gpus (%d)' % (args.batch_size, nb_gpus)
@@ -147,6 +177,10 @@ else:
         int_steps=args.int_steps,
         int_downsize=args.int_downsize
     )
+    
+    if args.random_mode:
+        print("Initalizing RandomFeaturesNet with: ", args.n_features,args.filt_size)
+        fnet = vxm.networks.RandomFeatureNet(n_features = args.n_features, filt_size = args.filt_size, device = device).to(device)
 
 if nb_gpus > 1:
     # use multiple GPUs via DataParallel
@@ -160,13 +194,18 @@ model.train()
 # set optimizer
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+print("The current loss type chosen is: ", args.image_loss)
 # prepare image loss
 if args.image_loss == 'ncc':
     image_loss_func = vxm.losses.NCC().loss
 elif args.image_loss == 'mse':
     image_loss_func = vxm.losses.MSE().loss
+elif args.image_loss == 'cl':
+    image_loss_func = vxm.losses.CL(args.cl_type).loss
+elif args.image_loss == 'nmi':
+    image_loss_func = vxm.losses.MutualInformation()
 else:
-    raise ValueError('Image loss should be "mse" or "ncc", but found "%s"' % args.image_loss)
+    raise ValueError('Image loss should be "mse", "ncc" or "cl", but found "%s"' % args.image_loss)
 
 # need two image loss functions if bidirectional
 if bidir:
@@ -180,17 +219,26 @@ else:
 losses += [vxm.losses.Grad('l2', loss_mult=args.int_downsize).loss]
 weights += [args.weight]
 
+loss_log = []
+val_loss_log = []
+
 # training loops
 for epoch in range(args.initial_epoch, args.epochs):
 
     # save model checkpoint
     if epoch % 20 == 0:
         model.save(os.path.join(model_dir, '%04d.pt' % epoch))
+        if args.random_mode:
+            torch.save(fnet, os.path.join(model_dir, 'fnet_%04d.pt' % epochs))
 
     epoch_loss = []
     epoch_total_loss = []
     epoch_step_time = []
 
+    val_epoch_loss = []
+    val_epoch_total_loss = []
+
+    model.train()
     for step in range(args.steps_per_epoch):
 
         step_start_time = time.time()
@@ -207,7 +255,11 @@ for epoch in range(args.initial_epoch, args.epochs):
         loss = 0
         loss_list = []
         for n, loss_function in enumerate(losses):
-            curr_loss = loss_function(y_true[n], y_pred[n]) * weights[n]
+            if n==0:
+                IF,JF = fnet(y_true[n],y_pred[n])
+                curr_loss = loss_function(IF,JF) * weights[n]
+            else:
+                curr_loss = loss_function(y_true[n], y_pred[n]) * weights[n]
             loss_list.append(curr_loss.item())
             loss += curr_loss
 
@@ -221,13 +273,46 @@ for epoch in range(args.initial_epoch, args.epochs):
 
         # get compute time
         epoch_step_time.append(time.time() - step_start_time)
+    
+    model.eval()
+    with torch.no_grad():
+        for step in range(val_steps_per_epoch):
+
+            # generate inputs (and true outputs) and convert them to tensors
+            val_inputs, val_y_true = next(val_generator)
+            val_inputs = [torch.from_numpy(d).to(device).float().permute(0, 4, 1, 2, 3) for d in val_inputs]
+            val_y_true = [torch.from_numpy(d).to(device).float().permute(0, 4, 1, 2, 3) for d in val_y_true]
+
+            # run inputs through the model to produce a warped image and flow field
+            val_y_pred = model(*val_inputs)
+
+            # calculate total loss
+            val_loss = 0
+            val_loss_list = []
+            for n, loss_function in enumerate(losses):
+                val_curr_loss = loss_function(val_y_true[n], val_y_pred[n]) * weights[n]
+                val_loss_list.append(val_curr_loss.item())
+                val_loss += val_curr_loss
+
+            val_epoch_loss.append(val_loss_list)
+            val_epoch_total_loss.append(val_loss.item())
 
     # print epoch info
     epoch_info = 'Epoch %d/%d' % (epoch + 1, args.epochs)
     time_info = '%.4f sec/step' % np.mean(epoch_step_time)
     losses_info = ', '.join(['%.4e' % f for f in np.mean(epoch_loss, axis=0)])
     loss_info = 'loss: %.4e  (%s)' % (np.mean(epoch_total_loss), losses_info)
-    print(' - '.join((epoch_info, time_info, loss_info)), flush=True)
+    val_loss_info = 'val loss: %.4e ' % (np.mean(val_epoch_total_loss))
+    print(' - '.join((epoch_info, time_info, loss_info, val_loss_info)), flush=True)
+    loss_log.append(np.mean(epoch_total_loss))
+    val_loss_log.append(np.mean(val_epoch_total_loss))
+
+    plt.plot(loss_log, color = 'blue')
+    plt.plot(val_loss_log, color = 'green')
+    plt.savefig(os.path.join(model_dir, 'loss_log.png'))
+
 
 # final model save
 model.save(os.path.join(model_dir, '%04d.pt' % args.epochs))
+if args.random_mode:
+    torch.save(fnet, os.path.join(model_dir, 'fnet_%04d.pt' % args.epochs))

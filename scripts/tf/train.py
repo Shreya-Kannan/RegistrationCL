@@ -38,8 +38,10 @@ import os
 import random
 import argparse
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import voxelmorph as vxm
+import json
+from matplotlib import pyplot as plt
 
 
 # disable eager execution
@@ -95,8 +97,12 @@ parser.add_argument('--legacy-image-sigma', dest='image_sigma', type=float, defa
 args = parser.parse_args()
 
 # load and prepare training data
-train_files = vxm.py.utils.read_file_list(args.img_list, prefix=args.img_prefix,
-                                          suffix=args.img_suffix)
+#train_files = vxm.py.utils.read_file_list(args.img_list, prefix=args.img_prefix,
+                                          #suffix=args.img_suffix)
+with open(args.img_list) as f:
+    json_file = json.load(f)
+    train_files = json_file["training_paired_images"]
+    val_files = json_file["registration_val"]
 assert len(train_files) > 0, 'Could not find any training data.'
 
 # no need to append an extra feature axis if data is multichannel
@@ -112,8 +118,10 @@ if args.atlas:
                                              add_feat_axis=add_feat_axis)
 else:
     # scan-to-scan generator
-    generator = vxm.generators.scan_to_scan(
+    generator = vxm.generators.scan_to_scan_custom(
         train_files, batch_size=args.batch_size, bidir=args.bidir, add_feat_axis=add_feat_axis)
+    val_generator = vxm.generators.scan_to_scan_custom(
+        val_files, batch_size=args.batch_size, bidir=args.bidir, add_feat_axis=add_feat_axis)
 
 # extract shape and number of features from sampled input
 sample_shape = next(generator)[0][0].shape
@@ -157,6 +165,8 @@ if args.image_loss == 'ncc':
     image_loss_func = vxm.losses.NCC().loss
 elif args.image_loss == 'mse':
     image_loss_func = vxm.losses.MSE(args.image_sigma).loss
+elif args.image_loss == 'nmi':
+     image_loss_func = vxm.losses.MutualInformation().loss
 else:
     raise ValueError('Image loss should be "mse" or "ncc", but found "%s"' % args.image_loss)
 
@@ -190,10 +200,24 @@ model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr), loss=lo
 # save starting weights
 model.save(save_filename.format(epoch=args.initial_epoch))
 
-model.fit(generator,
+history = model.fit(generator,
          initial_epoch=args.initial_epoch,
+         validation_data=val_generator,
          epochs=args.epochs,
          steps_per_epoch=args.steps_per_epoch,
+         validation_steps = len(val_files),
          callbacks=[save_callback],
          verbose=1
          )
+
+training_accuracy=history.history['accuracy']
+training_loss=history.history['loss']
+valid_accuracy=history.history['val_accuracy']
+valid_loss=history.history['val_loss']
+
+plt.plot(training_accuracy, label='train_acc')
+plt.plot(valid_accuracy, label='val_acc')
+plt.plot(training_loss, label='train_loss')
+plt.plot(valid_loss, label='val_loss')
+
+plt.savefig('/home/shreya/scratch/voxelmorph/log/loss_log_tf_MI.png')

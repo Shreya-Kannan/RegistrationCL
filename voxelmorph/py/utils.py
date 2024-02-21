@@ -73,7 +73,8 @@ def load_volfile(
     add_feat_axis=False,
     pad_shape=None,
     resize_factor=1,
-    ret_affine=False
+    ret_affine=False,
+    normalize = True
 ):
     """
     Loads a file in nii, nii.gz, mgz, npz, or npy format. If input file is not a string,
@@ -114,6 +115,9 @@ def load_volfile(
     else:
         raise ValueError('unknown filetype for %s' % filename)
 
+    #normalize
+    if normalize:
+        vol = (vol - vol.min()) / (vol.max() - vol.min())
     if pad_shape:
         vol, _ = pad(vol, pad_shape)
 
@@ -273,11 +277,13 @@ def dice(array1, array2, labels=None, include_zero=False):
         include_zero: Include label 0 in label list. Default is False.
     """
     if labels is None:
-        labels = np.concatenate([np.unique(a) for a in [array1, array2]])
+        #labels = np.concatenate([np.unique(a) for a in [array1, array2]])
+        list1 = np.unique(array1)
+        list2 = np.unique(array2)
+        labels = np.intersect1d(list1, list2)
         labels = np.sort(np.unique(labels))
     if not include_zero:
         labels = np.delete(labels, np.argwhere(labels == 0)) 
-
     dicem = np.zeros(len(labels))
     for idx, label in enumerate(labels):
         top = 2 * np.sum(np.logical_and(array1 == label, array2 == label))

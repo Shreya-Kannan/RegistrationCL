@@ -303,3 +303,38 @@ class ConvBlock(nn.Module):
         out = self.main(x)
         out = self.activation(out)
         return out
+
+
+#  https://people.eecs.berkeley.edu/~brecht/papers/07.rah.rec.nips.pdf
+class RandomFeatureNet(nn.Module):
+  def __init__(self, n_features = 8, filt_size = 5, nChannel = 1, ndim = 2, device = 'cuda'):
+    super(RandomFeatureNet, self).__init__()
+    """# On the first conv layer can have kernel_size > 1
+    self.c1 = nn.Conv3d(nChannel, 16, kernel_size= filt_size ,padding='same')   
+    # all subsequent conv layers must have kernel_size = 1
+    self.c2 = nn.Conv3d(16, 16, kernel_size=1)
+    self.c3 = nn.Conv3d(16, n_features, kernel_size=1)"""
+    self.n_features = n_features
+    self.filt_size = filt_size
+    self.nChannel = nChannel
+    self.n_dim = ndim
+    self.device = device
+    self.pi = torch.acos(torch.zeros(1)).item() * 2.0
+    self.fact = torch.tensor(np.sqrt(2.0/(n_features))).to(device)
+
+    self.c1 = nn.Conv3d(nChannel, 16, kernel_size=filt_size,padding='same') 
+    self.c2 = nn.Conv3d(16, 16, kernel_size=filt_size,padding='same')
+    self.c3 = nn.Conv3d(16, n_dim, kernel_size=1,padding='same')
+    self.bias = torch.nn.Parameter(2.*self.pi*torch.rand(n_features).to(device), requires_grad=True)
+
+    
+  def forward(self, I, J):
+    filt = torch.randn((self.n_features,self.n_dim,1,1,1)).to(self.device)
+    
+    IF = self.c3(F.elu(self.c2(F.elu(self.c1(I)))))
+    IF = torch.cos(F.conv2d(IF,filt,self.bias,padding='same'))*fact
+    
+    JF = self.c3(F.elu(self.c2(F.elu(self.c1(J)))))
+    JF = torch.cos(F.conv2d(JF,filt,self.bias,padding='same'))*fact
+    
+    return IF,JF
